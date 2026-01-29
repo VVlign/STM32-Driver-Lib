@@ -1,0 +1,31 @@
+# Keil MDK
+*.uvguix.*
+*.uvopt
+*.bak
+*.o
+*.d
+*.crf
+*.lst
+*.map
+*.axf
+*.lnp
+*.dep
+*.hex
+*.bin
+
+# IAR
+Debug/
+Release/
+*.ewt
+*.sfr
+
+# VSCode
+.vscode/
+
+# Build
+Build/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
