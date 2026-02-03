@@ -35,6 +35,8 @@
 static uint32_t RS485_GetTick(void);
 static bool RS485_IsTimeout(uint32_t start_time, uint32_t timeout_ms);
 
+RS485_Handle_t rs485_device; 
+
 /* 私有函数实现 --------------------------------------------------------------*/
 
 /**
@@ -78,7 +80,8 @@ static bool RS485_IsTimeout(uint32_t start_time, uint32_t timeout_ms)
 RS485_Error_t RS485_Init(RS485_Handle_t *handle, 
                          void *uart_handle,
                          void *de_port, 
-                         uint16_t de_pin)
+                         uint16_t de_pin,
+                         RS485_Mode_t mode)  // ← 新增参数)
 {
     // 参数检查
     if (handle == NULL || uart_handle == NULL || de_port == NULL) {
@@ -92,11 +95,23 @@ RS485_Error_t RS485_Init(RS485_Handle_t *handle,
     handle->uart_handle = uart_handle;
     handle->de_gpio_port = de_port;
     handle->de_gpio_pin = de_pin;
+    handle->mode = mode;
     
     // 初始化状态
     handle->state = RS485_STATE_IDLE;
-    handle->timeout_ms = RS485_DEFAULT_TIMEOUT;
+    handle->timeout_ms = RS485_DEFAULT_TIMEOUT;      // 接收超时1000ms
     
+    // ========== 新增：发送超时设置 ========== 
+    handle->tx_timeout_ms = 500;  // 发送超时500ms（根据波特率调整）
+    
+    /*****如果USART波特率可配置****
+    handle->baudrate = 9600;
+
+    // 动态计算
+    uint32_t bit_time_us = 1000000 / handle->baudrate;  // 每位的微秒数
+    uint32_t byte_time_ms = (bit_time_us * 10) / 1000;  // 每字节毫秒数
+    handle->tx_timeout_ms = tx_len * byte_time_ms * 2;  // 2倍安全系数               ***************/
+        
     // DE引脚初始化为低电平（接收模式）
     RS485_DE_LOW(handle);
     
@@ -120,45 +135,72 @@ RS485_Error_t RS485_TransmitReceive(RS485_Handle_t *handle,
 {
     // 参数检查
     if (handle == NULL || tx_data == NULL || tx_len == 0) {
+        // ========== 记录错误 ========== 
+        if (handle != NULL) {
+            handle->last_error = RS485_ERR_INVALID_PARAM;
+        }
         return RS485_ERR_INVALID_PARAM;
     }
     
     if (tx_len > RS485_TX_BUFFER_SIZE) {
+        handle->last_error = RS485_ERR_INVALID_PARAM;
         return RS485_ERR_INVALID_PARAM;
     }
     
     if (rx_expected > RS485_RX_BUFFER_SIZE) {
+        handle->last_error = RS485_ERR_INVALID_PARAM;
         return RS485_ERR_INVALID_PARAM;
     }
     
     // 检查设备是否空闲
     if (handle->state != RS485_STATE_IDLE) {
+        handle->last_error = RS485_ERR_BUSY;
         return RS485_ERR_BUSY;
     }
     
-    // 复制数据到内部缓冲区（重要！防止用户数据被销毁）
+    // 复制数据到内部缓冲区
     memcpy(handle->tx_buffer, tx_data, tx_len);
     handle->tx_size = tx_len;
     handle->rx_expected = rx_expected;
     handle->rx_size = 0;
     handle->timeout_ms = timeout_ms;
+    
+    // ========== 动态计算发送超时 ========== 
+    // 假设波特率9600，每字节约1ms10位）
+    // 实际应该根据UART配置动态计算
+    uint32_t tx_time_estimate = (tx_len * 10 * 1000) / 9600;
+    handle->tx_timeout_ms = tx_time_estimate * 2 + 50;
+    
     handle->last_tx_time = RS485_GetTick();
     
     // 切换到发送模式
     RS485_DE_HIGH(handle);
+    for(volatile uint32_t i = 0; i < 100; i++);
     handle->state = RS485_STATE_TX;
     
-    // 启动UART中断发送
     UART_HandleTypeDef *huart = (UART_HandleTypeDef *)handle->uart_handle;
-    HAL_StatusTypeDef hal_status = HAL_UART_Transmit_IT(huart, handle->tx_buffer, handle->tx_size);
+    HAL_StatusTypeDef hal_status;
+    
+    // ========== 根据模式选择发送方式 ========== 
+    if (handle->mode == RS485_MODE_DMA) {
+        // DMA方式发送
+        hal_status = HAL_UART_Transmit_DMA(huart, handle->tx_buffer, handle->tx_size);
+    } else {
+        // 中断方式发送（默认）
+        hal_status = HAL_UART_Transmit_IT(huart, handle->tx_buffer, handle->tx_size);
+    }
     
     if (hal_status != HAL_OK) {
-        // 发送失败，恢复状态
+        // ========== 发送启动失败，记录错误 ========== 
         RS485_DE_LOW(handle);
         handle->state = RS485_STATE_IDLE;
+        handle->last_error = RS485_ERR_HW_FAULT;
+        handle->tx_error_count++;  // 统计
         return RS485_ERR_HW_FAULT;
     }
     
+    // ========== 成功启动发送 ========== 
+    handle->last_error = RS485_OK;
     return RS485_OK;
 }
 
@@ -173,34 +215,82 @@ RS485_Error_t RS485_Process(RS485_Handle_t *handle)
         return RS485_ERR_INVALID_PARAM;
     }
     
-    // 根据当前状态处理
+    UART_HandleTypeDef *huart = (UART_HandleTypeDef *)handle->uart_handle;
+    
     switch (handle->state) {
         case RS485_STATE_IDLE:
-        case RS485_STATE_TX:
         case RS485_STATE_RX_DONE:
-        case RS485_STATE_ERROR:
             // 这些状态不需要处理
             break;
-            
-        case RS485_STATE_WAIT_RX:
-            // 检查是否超时
-            if (RS485_IsTimeout(handle->last_tx_time, handle->timeout_ms)) {
-                // 超时，中止接收
-                UART_HandleTypeDef *huart = (UART_HandleTypeDef *)handle->uart_handle;
-                HAL_UART_AbortReceive_IT(huart);
+        
+        // ========== 发送状态：检测超时 ========== 
+        case RS485_STATE_TX:
+            if (RS485_IsTimeout(handle->last_tx_time, handle->tx_timeout_ms)) {
+                // 发送超时
+                HAL_UART_AbortTransmit_IT(huart);
+                RS485_DE_LOW(handle);
                 
-                handle->state = RS485_STATE_TIMEOUT;
+                // 记录错误
+                handle->last_error = RS485_ERR_TIMEOUT;
+                handle->tx_error_count++;
+                handle->timeout_count++;
                 
-                // 调用错误回调
+                // 判断是否重试
+                if (handle->retry_count < handle->max_retries) {
+                    handle->retry_count++;
+                    handle->state = RS485_STATE_IDLE;  // 恢复到空闲，允许重试
+                } else {
+                    // 超过重试次数，进入错误状态
+                    handle->state = RS485_STATE_ERROR;
+                }
+                
+                // 调用用户错误回调
                 if (handle->error_callback != NULL) {
                     handle->error_callback(RS485_ERR_TIMEOUT);
                 }
             }
             break;
             
+        // ========== 等待接收状态：检测超时 ========== 
+        case RS485_STATE_WAIT_RX:
+            if (RS485_IsTimeout(handle->last_tx_time, handle->timeout_ms)) {
+                // 接收超时
+                HAL_UART_AbortReceive_IT(huart);
+                
+                // 记录错误
+                handle->last_error = RS485_ERR_TIMEOUT;
+                handle->rx_error_count++;
+                handle->timeout_count++;
+                
+                // 判断是否重试
+                if (handle->retry_count < handle->max_retries) {
+                    handle->retry_count++;
+                    handle->state = RS485_STATE_IDLE;
+                } else {
+                    handle->state = RS485_STATE_TIMEOUT;
+                }
+                
+                // 调用用户错误回调
+                if (handle->error_callback != NULL) {
+                    handle->error_callback(RS485_ERR_TIMEOUT);
+                }
+            }
+            break;
+        
+        // ========== 超时状态：自动恢复 ========== 
         case RS485_STATE_TIMEOUT:
-            // 超时后自动恢复到空闲状态（可选，根据需求调整）
+            // 延迟一段时间后自动恢复
+            // 可以在这里检查是否满足恢复条件
             handle->state = RS485_STATE_IDLE;
+            handle->retry_count = 0;  // 重置重试计数
+            break;
+        
+        // ========== 错误状态：需要用户手动恢复 ========== 
+        case RS485_STATE_ERROR:
+            // 错误状态不会自动恢复
+            // 用户需要调用 RS485_ClearError() 或 RS485_ForceReset()
+//            RS485_ClearError(&rs485_device);
+//            RS485_ForceReset(&rs485_device);
             break;
             
         default:
@@ -231,18 +321,34 @@ void RS485_TxCpltCallback(RS485_Handle_t *handle)
     
     // 判断是否需要接收响应
     if (handle->rx_expected > 0) {
-        // 启动接收
         UART_HandleTypeDef *huart = (UART_HandleTypeDef *)handle->uart_handle;
-        HAL_StatusTypeDef hal_status = HAL_UART_Receive_IT(huart, 
-                                                            handle->rx_buffer, 
-                                                            handle->rx_expected);
+        HAL_StatusTypeDef hal_status;
+        
+        // ========== 根据模式选择接收方式 ========== 
+        if (handle->mode == RS485_MODE_DMA) {
+            // DMA方式：使用空闲中断接收（不定长）
+            hal_status = HAL_UARTEx_ReceiveToIdle_DMA(huart, 
+                                                      handle->rx_buffer, 
+                                                      RS485_RX_BUFFER_SIZE);
+            // 禁用DMA半传输完成中断（可选）
+            __HAL_DMA_DISABLE_IT(huart->hdmarx, DMA_IT_HT);
+        } else {
+            // 中断方式：定长接收
+            hal_status = HAL_UART_Receive_IT(huart, 
+                                             handle->rx_buffer, 
+                                             handle->rx_expected);
+        }
         
         if (hal_status == HAL_OK) {
             handle->state = RS485_STATE_WAIT_RX;
             handle->last_tx_time = RS485_GetTick();  // 重置超时计时
+            handle->last_error = RS485_OK;
         } else {
-            // 启动接收失败
+            // ========== 启动接收失败 ========== 
             handle->state = RS485_STATE_ERROR;
+            handle->last_error = RS485_ERR_HW_FAULT;
+            handle->rx_error_count++;
+            
             if (handle->error_callback != NULL) {
                 handle->error_callback(RS485_ERR_HW_FAULT);
             }
@@ -250,6 +356,7 @@ void RS485_TxCpltCallback(RS485_Handle_t *handle)
     } else {
         // 不需要接收，直接完成
         handle->state = RS485_STATE_IDLE;
+        handle->retry_count = 0;  // 成功后重置重试计数
     }
 }
 
@@ -267,6 +374,29 @@ void RS485_RxCpltCallback(RS485_Handle_t *handle)
     // 接收完成
     handle->rx_size = handle->rx_expected;
     handle->state = RS485_STATE_RX_DONE;
+    handle->last_error = RS485_OK;
+    handle->retry_count = 0;  // 成功后重置重试计数
+    
+    // 调用用户的接收完成回调
+    if (handle->rx_complete_callback != NULL) {
+        handle->rx_complete_callback(handle->rx_buffer, handle->rx_size);
+    }
+}
+
+/**
+ * @brief  UART接收事件回调（DMA空闲中断）
+ */
+void RS485_RxEventCallback(RS485_Handle_t *handle, uint16_t Size)
+{
+    if (handle == NULL || handle->state != RS485_STATE_WAIT_RX) {
+        return;
+    }
+    
+    // DMA接收完成（触发了空闲中断）
+    handle->rx_size = Size;  // 实际接收的字节数
+    handle->state = RS485_STATE_RX_DONE;
+    handle->last_error = RS485_OK;
+    handle->retry_count = 0;
     
     // 调用用户的接收完成回调
     if (handle->rx_complete_callback != NULL) {
@@ -310,4 +440,115 @@ void RS485_AbortTransfer(RS485_Handle_t *handle)
     handle->state = RS485_STATE_IDLE;
     handle->rx_size = 0;
     handle->tx_size = 0;
+}
+
+/* 错误处理函数实现 ---------------------------------------------------------*/
+
+/**
+ * @brief  获取最后一次错误码
+ */
+RS485_Error_t RS485_GetLastError(const RS485_Handle_t *handle)
+{
+    if (handle == NULL) {
+        return RS485_ERR_INVALID_PARAM;
+    }
+    return handle->last_error;
+}
+
+/**
+ * @brief  清除错误状态
+ */
+void RS485_ClearError(RS485_Handle_t *handle)
+{
+    if (handle == NULL) {
+        return;
+    }
+    
+    handle->last_error = RS485_OK;
+    handle->retry_count = 0;
+    
+    // 如果处于错误状态，恢复到空闲状态
+    if (handle->state == RS485_STATE_ERROR || 
+        handle->state == RS485_STATE_TIMEOUT) {
+        handle->state = RS485_STATE_IDLE;
+    }
+}
+
+/**
+ * @brief  强制复位驱动
+ */
+void RS485_ForceReset(RS485_Handle_t *handle)
+{
+    if (handle == NULL) {
+        return;
+    }
+    
+    UART_HandleTypeDef *huart = (UART_HandleTypeDef *)handle->uart_handle;
+    
+    // 1. 中止所有UART传输
+    HAL_UART_Abort_IT(huart);
+    
+    // 2. 恢复DE引脚到接收状态
+    RS485_DE_LOW(handle);
+    
+    // 3. 清空缓冲区
+    memset(handle->tx_buffer, 0, RS485_TX_BUFFER_SIZE);
+    memset(handle->rx_buffer, 0, RS485_RX_BUFFER_SIZE);
+    handle->tx_size = 0;
+    handle->rx_size = 0;
+    
+    // 4. 重置状态
+    handle->state = RS485_STATE_IDLE;
+    handle->retry_count = 0;
+    
+    // 5. 清除错误（但保留统计信息，便于调试）
+    handle->last_error = RS485_OK;
+}
+
+/**
+ * @brief  获取错误统计信息
+ */
+void RS485_GetErrorStats(const RS485_Handle_t *handle, 
+                        uint16_t *tx_errors,
+                        uint16_t *rx_errors,
+                        uint16_t *timeouts)
+{
+    if (handle == NULL) {
+        return;
+    }
+    
+    if (tx_errors != NULL) {
+        *tx_errors = handle->tx_error_count;
+    }
+    
+    if (rx_errors != NULL) {
+        *rx_errors = handle->rx_error_count;
+    }
+    
+    if (timeouts != NULL) {
+        *timeouts = handle->timeout_count;
+    }
+}
+
+/**
+ * @brief  获取错误描述字符串
+ */
+const char* RS485_GetErrorString(RS485_Error_t error)
+{
+    switch(error) {
+        case RS485_OK:
+            return "No error";
+        case RS485_ERR_BUSY:
+            return "Device busy";
+        case RS485_ERR_TIMEOUT:
+            return "Timeout";
+        case RS485_ERR_CRC:
+            return "CRC error";
+        case RS485_ERR_INVALID_PARAM:
+            return "Invalid parameter";
+        case RS485_ERR_HW_FAULT:
+            return "Hardware fault";
+        default:
+            return "Unknown error";
+    }
 }
